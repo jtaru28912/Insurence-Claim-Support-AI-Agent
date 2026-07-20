@@ -1,0 +1,91 @@
+name: Deploy To EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy"
+        required: false
+        default: "main"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Check out selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Verify quality gate before deployment
+        run: |
+          ruff check .
+          pytest tests -q
+
+      - name: Deploy application on EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.EC2_APP_DIR }}"
+            RELEASE_DIR="$APP_DIR/releases/${GITHUB_SHA}"
+            mkdir -p "$APP_DIR/releases" "$APP_DIR/shared/storage/db" "$APP_DIR/shared/storage/vector_store"
+            if [ -d "$APP_DIR/current" ]; then
+              CURRENT_TARGET="$(readlink -f "$APP_DIR/current")"
+              echo "$CURRENT_TARGET" > "$APP_DIR/last_successful_release.txt"
+            fi
+            git clone --depth 1 --branch "${{ inputs.ref }}" "https://github.com/${{ github.repository }}.git" "$RELEASE_DIR"
+            cp "$APP_DIR/shared/.env" "$RELEASE_DIR/.env"
+            ln -sfn "$APP_DIR/shared/storage" "$RELEASE_DIR/storage"
+            cd "$RELEASE_DIR"
+            docker compose build
+            docker compose up -d
+            ln -sfn "$RELEASE_DIR" "$APP_DIR/current"
+
+      - name: Verify deployed health endpoint
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.EC2_APP_DIR }}"
+            cd "$APP_DIR/current"
+            curl --fail --retry 10 --retry-delay 5 http://localhost:8000/health
+
+      - name: Roll back on failed health check
+        if: failure()
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.EC2_APP_DIR }}"
+            if [ -f "$APP_DIR/last_successful_release.txt" ]; then
+              PREVIOUS_RELEASE="$(cat "$APP_DIR/last_successful_release.txt")"
+              ln -sfn "$PREVIOUS_RELEASE" "$APP_DIR/current"
+              cd "$APP_DIR/current"
+              docker compose up -d
+              curl --fail --retry 10 --retry-delay 5 http://localhost:8000/health
+            else
+              echo "No rollback target recorded."
+              exit 1
+            fi
